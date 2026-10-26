@@ -1,6 +1,12 @@
 use anyhow::{Context, bail};
 use futures::prelude::*;
-use ocpp_rs::v16::{call, data_types, enums};
+use ocpp_rs::v16::{
+    call::{self, Action},
+    data_types, enums,
+    parse::{self, Message},
+    pending::PendingCalls,
+    typed_call_result::TypedCallResult,
+};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time;
@@ -10,6 +16,7 @@ use tracing::{debug, error, info, warn};
 use std::{
     collections::VecDeque,
     ops::ControlFlow,
+    pin::{Pin, pin},
     time::{Duration, Instant},
 };
 
@@ -24,12 +31,16 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_mins(1);
 #[derive(Debug)]
 pub struct ChargePointSimu {
     scenario: VecDeque<CallEvent>,
+    charging_steps_interval: Duration,
+    with_heartbeats: bool,
+    cur_tid: Option<i32>,
     ws_stream: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     msg_id: usize,
+    call_response_tracker: PendingCalls,
 }
 
 impl ChargePointSimu {
-    pub fn new() -> Self {
+    pub fn new(charging_steps_interval: Duration, with_heartbeats: bool) -> Self {
         let scenario = VecDeque::from_iter([
             CallEvent::StatusNotification {
                 connector_id: 0,
@@ -39,17 +50,82 @@ impl ChargePointSimu {
                 connector_id: 1,
                 status: enums::ChargePointStatus::Available,
             },
+            CallEvent::MeterValues {
+                energy: 1234,
+                power: 0,
+                voltage: 231,
+                temp: 25,
+                transaction_id: None,
+            },
             CallEvent::StatusNotification {
                 connector_id: 1,
                 status: enums::ChargePointStatus::Preparing,
             },
             CallEvent::StartTransaction { meter_start: 1234 },
+            CallEvent::StatusNotification {
+                connector_id: 1,
+                status: enums::ChargePointStatus::Charging,
+            },
+            CallEvent::MeterValues {
+                energy: 1235,
+                power: 0,
+                voltage: 231,
+                temp: 25,
+                transaction_id: Some(1),
+            },
+            CallEvent::MeterValues {
+                energy: 1265,
+                power: 3_600,
+                voltage: 230,
+                temp: 25,
+                transaction_id: Some(1),
+            },
+            CallEvent::MeterValues {
+                energy: 1325,
+                power: 3_600,
+                voltage: 229,
+                temp: 26,
+                transaction_id: Some(1),
+            },
+            CallEvent::MeterValues {
+                energy: 1385,
+                power: 3_600,
+                voltage: 228,
+                temp: 26,
+                transaction_id: Some(1),
+            },
+            CallEvent::MeterValues {
+                energy: 1505,
+                power: 7_200,
+                voltage: 227,
+                temp: 27,
+                transaction_id: Some(1),
+            },
+            CallEvent::MeterValues {
+                energy: 1625,
+                power: 7_200,
+                voltage: 227,
+                temp: 28,
+                transaction_id: Some(1),
+            },
+            CallEvent::StatusNotification {
+                connector_id: 1,
+                status: enums::ChargePointStatus::SuspendedEVSE,
+            },
+            // CallEvent::StatusNotification {
+            //     connector_id: 1,
+            //     status: enums::ChargePointStatus::SuspendedEV,
+            // },
         ]);
 
         ChargePointSimu {
             scenario,
+            charging_steps_interval,
+            with_heartbeats,
+            cur_tid: None,
             ws_stream: None,
             msg_id: 0,
+            call_response_tracker: PendingCalls::new(),
         }
     }
 
@@ -100,13 +176,39 @@ impl ChargePointSimu {
     }
 
     async fn start(&mut self) -> anyhow::Result<()> {
+        let mut next_evt = None;
+        let mut last_evt_instant = Instant::now();
         let mut last_checkpoint_instant = Instant::now();
 
         loop {
-            if let Some(evt) = self.scenario.pop_front() {
-                time::sleep(EVENT_INTERVAL).await;
-                self.send_action(evt).await.context("sending evt")?;
+            if next_evt.is_none() {
+                next_evt = self.scenario.pop_front();
+                if next_evt.is_some() {
+                    last_evt_instant = Instant::now();
+                }
             }
+            // else previous instant has been sent yet
+
+            let next_evt_timer_fut = if next_evt.is_some() {
+                let next_evt_instant = if self.cur_tid.is_some() {
+                    self.charging_steps_interval
+                } else {
+                    EVENT_INTERVAL
+                };
+                pin!(time::sleep(
+                    next_evt_instant.saturating_sub(last_evt_instant.elapsed())
+                )) as Pin<&mut (dyn Future<Output = ()> + Send)>
+            } else {
+                pin!(std::future::pending()) as _
+            };
+
+            let maybe_heartbeat_fut = if self.with_heartbeats {
+                pin!(time::sleep(
+                    HEARTBEAT_TIMEOUT.saturating_sub(last_checkpoint_instant.elapsed())
+                )) as Pin<&mut (dyn Future<Output = ()> + Send)>
+            } else {
+                pin!(std::future::pending()) as _
+            };
 
             tokio::select! {
                 biased;
@@ -115,8 +217,7 @@ impl ChargePointSimu {
                         bail!("server disconnected");
                     };
 
-                    let now = Instant::now();
-                    last_checkpoint_instant = now;
+                    last_checkpoint_instant = Instant::now();
 
                     debug!(?server_msg);
                     let server_msg = server_msg.context("server msg")?;
@@ -129,11 +230,15 @@ impl ChargePointSimu {
                              break;
                          };
                 }
-                _ = time::sleep(HEARTBEAT_TIMEOUT.saturating_sub(last_checkpoint_instant.elapsed())) => {
+                _ = next_evt_timer_fut => {
+                    if let Some(next_evt) = next_evt.take() {
+                        self.send_action(next_evt).await.context("sending evt")?;
+                    }
+                }
+                _ = maybe_heartbeat_fut => {
                     debug!("heartbeat timeout");
 
-                    let now = Instant::now();
-                    last_checkpoint_instant = now;
+                    last_checkpoint_instant = Instant::now();
 
                     self
                         .send_action(CallEvent::Heartbeat)
@@ -145,15 +250,20 @@ impl ChargePointSimu {
         Ok(())
     }
 
-    async fn send_action(&mut self, evt: CallEvent) -> anyhow::Result<()> {
+    async fn send_action(&mut self, mut evt: CallEvent) -> anyhow::Result<()> {
+        if let CallEvent::MeterValues { transaction_id, .. } = &mut evt {
+            *transaction_id = self.cur_tid;
+        }
+
         let msg_id = self.next_msg_id();
         info!(?evt, %msg_id, "sending");
         self.ws_stream
             .as_mut()
             .unwrap()
             .send(ts::Message::Text(
-                serde_json::to_string(&call::Call::new(msg_id.to_string(), evt.into()))
-                    .context("serializing")?
+                self.call_response_tracker
+                    .send_call(call::Call::new(msg_id.to_string(), evt.into()))
+                    .context("call tracker")?
                     .into(),
             ))
             .await?;
@@ -164,10 +274,44 @@ impl ChargePointSimu {
     async fn handle_incoming_msg(&mut self, msg: ts::Message) -> ControlFlow<()> {
         match &msg {
             ts::Message::Text(text) => {
-                info!("incoming msg text: {text}");
+                debug!("incoming text msg: {text}");
+
+                let Ok(msg) = parse::deserialize_to_message(text) else {
+                    error!("Failed to deserialize message: {msg}");
+                    return ControlFlow::Continue(());
+                };
+                match msg {
+                    Message::Call(call) => {
+                        info!(?call);
+                        match call.payload {
+                            Action::StatusNotification(status) => {
+                                if status.status == enums::ChargePointStatus::Available {
+                                    self.cur_tid = None;
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
+                    Message::CallResult(call_result) => {
+                        info!(?call_result);
+                        match self.call_response_tracker.resolve(call_result) {
+                            Ok(TypedCallResult::StartTransaction(result)) => {
+                                info!(tid = result.payload.transaction_id);
+                                self.cur_tid = Some(result.payload.transaction_id);
+                            }
+                            Ok(TypedCallResult::StopTransaction(_)) => {
+                                self.cur_tid = None;
+                            }
+                            _ => (),
+                        }
+                    }
+                    Message::CallError(err) => {
+                        error!(?err);
+                    }
+                }
             }
             ts::Message::Binary(binary) => {
-                info!("incoming msg bin: {binary:?}");
+                info!("incoming bin msg: {binary:?}");
             }
             ts::Message::Ping(_) => {
                 info!("incoming ping");
@@ -205,6 +349,13 @@ enum CallEvent {
     StartTransaction {
         meter_start: u64,
     },
+    MeterValues {
+        energy: u64,
+        power: u64,
+        voltage: u64,
+        temp: u64,
+        transaction_id: Option<i32>,
+    },
 }
 
 impl From<CallEvent> for call::Action {
@@ -232,6 +383,57 @@ impl From<CallEvent> for call::Action {
                     meter_start,
                 })
             }
+            CallEvent::MeterValues {
+                energy,
+                power,
+                voltage,
+                temp,
+                transaction_id,
+            } => call::Action::MeterValues(call::MeterValues {
+                connector_id: 1,
+                transaction_id,
+                meter_value: vec![data_types::MeterValue {
+                    timestamp: data_types::DateTimeWrapper::new(chrono::Utc::now()),
+                    sampled_value: vec![
+                        data_types::SampledValue {
+                            value: energy.to_string(),
+                            context: None,
+                            format: None,
+                            measurand: Some(enums::Measurand::EnergyActiveImportRegister),
+                            phase: None,
+                            location: None,
+                            unit: Some(enums::UnitOfMeasure::Wh),
+                        },
+                        data_types::SampledValue {
+                            value: power.to_string(),
+                            context: None,
+                            format: None,
+                            measurand: Some(enums::Measurand::PowerActiveImport),
+                            phase: None,
+                            location: None,
+                            unit: Some(enums::UnitOfMeasure::W),
+                        },
+                        data_types::SampledValue {
+                            value: voltage.to_string(),
+                            context: None,
+                            format: None,
+                            measurand: Some(enums::Measurand::Voltage),
+                            phase: Some(enums::Phase::L1),
+                            location: None,
+                            unit: Some(enums::UnitOfMeasure::V),
+                        },
+                        data_types::SampledValue {
+                            value: temp.to_string(),
+                            context: None,
+                            format: None,
+                            measurand: Some(enums::Measurand::Temperature),
+                            phase: None,
+                            location: None,
+                            unit: Some(enums::UnitOfMeasure::Celsius),
+                        },
+                    ],
+                }],
+            }),
         }
     }
 }
